@@ -11,15 +11,20 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
 
 	"github.com/gorilla/mux"
 
-	"github.com/blevesearch/bleve/v2"
 	bleveMappingUI "github.com/blevesearch/bleve-mapping-ui"
+	"github.com/blevesearch/bleve/v2"
 	bleveHttp "github.com/blevesearch/bleve/v2/http"
 
 	// import general purpose configuration
@@ -33,26 +38,31 @@ var staticPath = flag.String("static", "",
 	"optional path to static directory for web resources")
 var staticBleveMappingPath = flag.String("staticBleveMapping", "",
 	"optional path to static-bleve-mapping directory for web resources")
+var mainDir, currentDir = "", ""
+var firstEnter = true
 
 func main() {
+	go handleOsSignals()
 	flag.Parse()
-
-	// walk the data dir and register index names
-	dirEntries, err := ioutil.ReadDir(*dataDir)
+	log.Println(*dataDir, " - Indexes directory, start reading")
+	defer os.RemoveAll(mainDir)
+	err := filepath.Walk(*dataDir, visit)
+	dirEntries, err := ioutil.ReadDir(mainDir)
 	if err != nil {
 		log.Fatalf("error reading data dir: %v", err)
 	}
-
+	log.Println("Indexes directory read has finished")
+	timer := exitIfIndexesDirectoryIsLocked()
 	for _, dirInfo := range dirEntries {
-		indexPath := *dataDir + string(os.PathSeparator) + dirInfo.Name()
-
+		indexPath := mainDir + string(os.PathSeparator) + dirInfo.Name()
+		log.Println("Reading indexes")
 		// skip single files in data dir since a valid index is a directory that
 		// contains multiple files
 		if !dirInfo.IsDir() {
 			log.Printf("not registering %s, skipping", indexPath)
 			continue
 		}
-
+		log.Println(indexPath, " - Path to the Index")
 		i, err := bleve.Open(indexPath)
 		if err != nil {
 			log.Printf("error opening index %s: %v", indexPath, err)
@@ -63,7 +73,8 @@ func main() {
 			i.SetName(dirInfo.Name())
 		}
 	}
-
+	timer.Stop()
+	log.Println("Indexes read finished")
 	router := mux.NewRouter()
 	router.StrictSlash(true)
 
@@ -97,7 +108,7 @@ func main() {
 	// add the API
 	bleveMappingUI.RegisterHandlers(router, "/api")
 
-	createIndexHandler := bleveHttp.NewCreateIndexHandler(*dataDir)
+	createIndexHandler := bleveHttp.NewCreateIndexHandler(mainDir)
 	createIndexHandler.IndexNameLookup = indexNameLookup
 	router.Handle("/api/{indexName}", createIndexHandler).Methods("PUT")
 
@@ -105,7 +116,7 @@ func main() {
 	getIndexHandler.IndexNameLookup = indexNameLookup
 	router.Handle("/api/{indexName}", getIndexHandler).Methods("GET")
 
-	deleteIndexHandler := bleveHttp.NewDeleteIndexHandler(*dataDir)
+	deleteIndexHandler := bleveHttp.NewDeleteIndexHandler(mainDir)
 	deleteIndexHandler.IndexNameLookup = indexNameLookup
 	router.Handle("/api/{indexName}", deleteIndexHandler).Methods("DELETE")
 
@@ -151,4 +162,71 @@ func main() {
 	http.Handle("/", router)
 	log.Printf("Listening on %v", *bindAddr)
 	log.Fatal(http.ListenAndServe(*bindAddr, nil))
+}
+
+func exitIfIndexesDirectoryIsLocked() *time.Timer {
+	timer := time.NewTimer(time.Second * 10)
+	go func() {
+		<-timer.C
+		os.RemoveAll(mainDir)
+		log.Fatalf("The %s directory is locked by another process. Exiting the program", *dataDir)
+	}()
+	return timer
+}
+
+func handleReadError(err error) {
+	if err != nil {
+		os.RemoveAll(mainDir)
+		log.Fatalf("Error %s while reading file/directory. Exiting the program", err)
+	}
+}
+
+func visit(p string, info os.FileInfo, err error) error {
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		createTempDir(p)
+		return nil
+	}
+	copyIndexFileToTempDirectory(p)
+	return nil
+}
+
+func createTempDir(p string) {
+	dir, err := os.MkdirTemp(mainDir, filepath.Base(p))
+	handleReadError(err)
+	if firstEnter == true {
+		mainDir = dir
+		firstEnter = false
+	}
+	currentDir = dir
+}
+
+func copyIndexFileToTempDirectory(p string) {
+	bytesRead, err := ioutil.ReadFile(p)
+	handleReadError(err)
+	fmt.Println(filepath.Join(currentDir, filepath.Base(p)))
+	dst, err := os.Create(filepath.Join(currentDir, filepath.Base(p)))
+	handleReadError(err)
+	defer dst.Close()
+	fmt.Println(dst.Name())
+	err = ioutil.WriteFile(dst.Name(), bytesRead, 0755)
+	handleReadError(err)
+}
+
+func handleOsSignals() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan bool, 1)
+
+	go func() {
+		sig := <-sigs
+		fmt.Printf("\nGot %s\n", sig)
+		fmt.Printf("Removing temporary dataDir '%s'\n", mainDir)
+		os.RemoveAll(mainDir)
+		log.Fatalf("Exiting program")
+		done <- true
+	}()
+	<-done
 }
